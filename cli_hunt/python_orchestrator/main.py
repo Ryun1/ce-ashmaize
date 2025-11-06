@@ -7,8 +7,11 @@ import subprocess
 import threading
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from typing import List, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from tui import ChallengeUpdate, LogMessage, OrchestratorTUI, RefreshTable
 
 # --- Constants ---
@@ -36,6 +39,25 @@ def setup_logging():
     # Silence noisy libraries
     logging.getLogger("requests").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+# --- HTTP Session Setup with Connection Pooling ---
+def create_session() -> requests.Session:
+    """Creates a requests session with connection pooling and retry strategy."""
+    session = requests.Session()
+    # Set up connection pooling
+    adapter = HTTPAdapter(
+        pool_connections=10,  # Number of connection pools to cache
+        pool_maxsize=20,  # Max number of connections to save in the pool
+        max_retries=Retry(
+            total=3,
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504],
+        ),
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 # --- DatabaseManager for Thread-Safe Operations ---
@@ -159,6 +181,38 @@ class DatabaseManager:
         with self._lock:
             return deepcopy(self._db.get(address, {}).get("challenge_queue", []))
 
+    def get_challenge_queues_batch(self, addresses: List[str]) -> dict:
+        """Get challenge queues for multiple addresses in a single lock acquisition."""
+        with self._lock:
+            return {
+                addr: deepcopy(self._db.get(addr, {}).get("challenge_queue", []))
+                for addr in addresses
+            }
+
+    def expire_challenges_batch(self, challenges_to_expire: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        """Expire multiple challenges in a single lock acquisition.
+        
+        Args:
+            challenges_to_expire: List of tuples (address, challenge_id)
+            
+        Returns:
+            List of tuples (address, challenge_id) that were successfully expired
+        """
+        if not challenges_to_expire:
+            return []
+        
+        expired = []
+        with self._lock:
+            for address, challenge_id in challenges_to_expire:
+                if address in self._db:
+                    queue = self._db[address].get("challenge_queue", [])
+                    for c in queue:
+                        if c["challengeId"] == challenge_id:
+                            c["status"] = "expired"
+                            expired.append((address, challenge_id))
+                            break
+        return expired
+
     def save_to_disk(self):
         logging.info("Saving database to disk...")
         with self._lock:
@@ -177,7 +231,7 @@ class DatabaseManager:
 # They accept a `tui_app` object to post messages back to the UI thread.
 
 
-def fetcher_worker(db_manager, stop_event, tui_app):
+def fetcher_worker(db_manager, stop_event, tui_app, session):
     tui_app.post_message(LogMessage("Fetcher thread started."))
     while not stop_event.is_set():
         tui_app.post_message(LogMessage("Fetching new challenges..."))
@@ -188,7 +242,7 @@ def fetcher_worker(db_manager, stop_event, tui_app):
             )
         else:
             try:
-                response = requests.get("https://sm.midnight.gd/api/challenge")
+                response = session.get("https://sm.midnight.gd/api/challenge")
                 response.raise_for_status()
                 challenge_data = response.json()["challenge"]
 
@@ -229,7 +283,7 @@ def fetcher_worker(db_manager, stop_event, tui_app):
     logging.info("Fetcher thread stopped.")
 
 
-def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
+def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge, session):
     """Solves a single challenge."""
     c = challenge  # for brevity
     msg = f"Attempting to solve challenge {c['challengeId']} for {address[:10]}..."
@@ -288,7 +342,7 @@ def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
         submit_url = (
             f"https://sm.midnight.gd/api/solution/{address}/{c['challengeId']}/{nonce}"
         )
-        submit_response = requests.post(submit_url)
+        submit_response = session.post(submit_url)
         submit_response.raise_for_status()
         validated_time = datetime.now(timezone.utc)
         tui_app.post_message(
@@ -370,7 +424,7 @@ def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
         tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "available"))
 
 
-def solver_worker(db_manager, stop_event, solve_interval, tui_app, max_solvers):
+def solver_worker(db_manager, stop_event, solve_interval, tui_app, max_solvers, session):
     tui_app.post_message(
         LogMessage(
             f"Solver thread started with {max_solvers} workers. Polling every {solve_interval / 60:.1f} minutes."
@@ -408,29 +462,24 @@ def solver_worker(db_manager, stop_event, solve_interval, tui_app, max_solvers):
             challenges_dispatched_this_round = 0
             if available_slots > 0:
                 addresses = db_manager.get_addresses()
+                # Batch fetch challenge queues to reduce lock contention
+                challenge_queues = db_manager.get_challenge_queues_batch(addresses)
                 now = datetime.now(timezone.utc)
                 should_break_outer_loop = False
+                
+                # Collect challenges to expire in batch
+                challenges_to_expire = []
 
                 for address in addresses:
-                    challenges = db_manager.get_challenge_queue(address)
+                    challenges = challenge_queues.get(address, [])
                     for c in challenges:
                         if c["status"] == "available":
                             latest_submission = datetime.fromisoformat(
                                 c["latestSubmission"].replace("Z", "+00:00")
                             )
                             if now > latest_submission:
-                                # Expire challenge
-                                updated_status = db_manager.update_challenge(
-                                    address, c["challengeId"], {"status": "expired"}
-                                )
-                                if updated_status:
-                                    msg = f"Challenge {c['challengeId']} for {address[:10]}... has expired."
-                                    tui_app.post_message(LogMessage(msg))
-                                    tui_app.post_message(
-                                        ChallengeUpdate(
-                                            address, c["challengeId"], updated_status
-                                        )
-                                    )
+                                # Collect expired challenges for batch processing
+                                challenges_to_expire.append((address, c["challengeId"]))
                             else:
                                 if available_slots > 0:
                                     # Claim the challenge by updating its status
@@ -454,6 +503,7 @@ def solver_worker(db_manager, stop_event, solve_interval, tui_app, max_solvers):
                                             stop_event,
                                             address,
                                             deepcopy(c),  # Pass a deepcopy
+                                            session,
                                         )
                                         active_futures.add(future)
                                         challenges_dispatched_this_round += 1
@@ -464,6 +514,16 @@ def solver_worker(db_manager, stop_event, solve_interval, tui_app, max_solvers):
                                     break  # Exit inner challenge loop
                     if should_break_outer_loop:
                         break  # Exit outer address loop
+                
+                # Batch expire challenges
+                if challenges_to_expire:
+                    expired = db_manager.expire_challenges_batch(challenges_to_expire)
+                    for address, challenge_id in expired:
+                        msg = f"Challenge {challenge_id} for {address[:10]}... has expired."
+                        tui_app.post_message(LogMessage(msg))
+                        tui_app.post_message(
+                            ChallengeUpdate(address, challenge_id, "expired")
+                        )
 
                 if challenges_dispatched_this_round > 0:
                     tui_app.post_message(
@@ -569,6 +629,9 @@ def run_orchestrator(args):
     """Starts and manages the TUI and all worker threads."""
     logging.info("Starting orchestrator TUI...")
     db_manager = DatabaseManager()
+    
+    # Create shared HTTP session with connection pooling
+    session = create_session()
 
     worker_functions = {
         "fetcher": fetcher_worker,
@@ -580,6 +643,7 @@ def run_orchestrator(args):
         "solve_interval": args.solve_interval,
         "save_interval": args.save_interval,
         "max_solvers": args.max_solvers,
+        "session": session,
     }
 
     app = OrchestratorTUI(
@@ -588,6 +652,8 @@ def run_orchestrator(args):
         worker_args=worker_args,
     )
     app.run()
+    # Clean up session on shutdown
+    session.close()
     logging.info("Orchestrator shut down.")
 
 

@@ -188,7 +188,8 @@ class OrchestratorTUI(App):
     def run_fetcher_worker(self) -> None:
         """Runs the fetcher logic in a background thread."""
         fetcher_func = self.worker_functions["fetcher"]
-        fetcher_func(self.db_manager, self.stop_event, self)
+        session = self.worker_args["session"]
+        fetcher_func(self.db_manager, self.stop_event, self, session)
 
     @work(name="solver", group="workers", thread=True)
     def run_solver_worker(self) -> None:
@@ -196,7 +197,8 @@ class OrchestratorTUI(App):
         solver_func = self.worker_functions["solver"]
         solve_interval = self.worker_args["solve_interval"]
         max_solvers = self.worker_args["max_solvers"]
-        solver_func(self.db_manager, self.stop_event, solve_interval, self, max_solvers)
+        session = self.worker_args["session"]
+        solver_func(self.db_manager, self.stop_event, solve_interval, self, max_solvers, session)
 
     @work(name="saver", group="workers", thread=True)
     def run_saver_worker(self) -> None:

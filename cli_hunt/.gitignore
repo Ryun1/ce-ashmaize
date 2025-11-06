@@ -12,3 +12,7 @@ challenges.json.journal
 web/
 
 .DS_Store
+
+keys/
+
+turbo/
